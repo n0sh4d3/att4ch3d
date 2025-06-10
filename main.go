@@ -41,9 +41,9 @@ func initialModel() model {
 
 	borderStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("27")).
+		BorderForeground(lipgloss.Color("31")).
 		Padding(1, 1).
-		Width(48).
+		Width(44).
 		Align(lipgloss.Center)
 
 	containerStyle := lipgloss.NewStyle().

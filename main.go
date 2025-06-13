@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -176,6 +177,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case tea.KeyEnter:
 			m.isSpeaking = true
+
+			// Method 1: Using separate arguments (recommended)
+			cmd := exec.Command("python3", "tts.py", m.textInput.Value())
+			err := cmd.Start() // Use Start() for non-blocking or Run() for blocking
+			if err != nil {
+				// Handle error appropriately
+				fmt.Printf("Error executing python command: %v\n", err)
+				m.isSpeaking = false
+				return m, nil
+			}
+
 			m.speakingStart = time.Now()
 			return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
 				return tickMsg(t)

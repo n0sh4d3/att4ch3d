@@ -15,14 +15,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/term"
 	"github.com/faiface/beep"
+	"github.com/faiface/beep/effects"
 	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
 )
 
 const (
 	SpeechLen = 20
-
-	// bubble tea lipgloss.Color values or how tf this is called
+	// fucjing lipgloss colors
 	Quiet    = "#7aa2f7"
 	MidQuiet = "#7dcfff"
 	MidLoud  = "#b4f9f8"
@@ -32,15 +32,57 @@ const (
 var speechElems = []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 
 type (
-	errMsg  error
-	tickMsg time.Time
+	errMsg    error
+	tickMsg   time.Time
+	volumeMsg float64
 )
 
-func main() {
-	p := tea.NewProgram(initialModel())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+type VolumeStreamer struct {
+	streamer    beep.Streamer
+	volume      *effects.Volume
+	volumeLevel float64
+	callback    func(float64)
+}
+
+func NewVolumeStreamer(s beep.Streamer, callback func(float64)) *VolumeStreamer {
+	volume := &effects.Volume{
+		Streamer: s,
+		Base:     2,
+		Volume:   0,
+		Silent:   false,
 	}
+
+	return &VolumeStreamer{
+		streamer: s,
+		volume:   volume,
+		callback: callback,
+	}
+}
+
+func (vs *VolumeStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+	n, ok = vs.streamer.Stream(samples)
+
+	if n > 0 {
+		var sum float64
+		for i := 0; i < n; i++ {
+			sample := (samples[i][0] + samples[i][1]) / 2
+			sum += sample * sample
+		}
+		rms := math.Sqrt(sum / float64(n))
+
+		vs.volumeLevel = vs.volumeLevel*0.7 + rms*0.3
+
+		if vs.callback != nil {
+			normalizedVolume := math.Min(vs.volumeLevel*10, 1.0)
+			vs.callback(normalizedVolume)
+		}
+	}
+
+	return n, ok
+}
+
+func (vs *VolumeStreamer) Err() error {
+	return vs.streamer.Err()
 }
 
 type model struct {
@@ -48,12 +90,28 @@ type model struct {
 	borderStyle    lipgloss.Style
 	containerStyle lipgloss.Style
 	barHeights     []int
+	barMomentum    []float64
+	barTargets     []float64
 	isSpeaking     bool
 	aiSpeech       string
 	aiSpeechStyles []lipgloss.Style
 	tickCount      int
 	speakingStart  time.Time
+	currentVolume  float64
+	volumeHistory  []float64
+	program        *tea.Program
+	randomSeeds    []float64
 	err            error
+}
+
+func main() {
+	m := initialModel()
+	p := tea.NewProgram(m)
+	m.program = p
+
+	if _, err := p.Run(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func initialModel() model {
@@ -79,7 +137,6 @@ func initialModel() model {
 		PaddingTop(height/8).
 		Align(lipgloss.Center, lipgloss.Top)
 
-	// this is just fucking sytling
 	DefaultSpeech := lipgloss.NewStyle().
 		Align(lipgloss.Center).
 		Padding(2, 4).
@@ -110,11 +167,17 @@ func initialModel() model {
 		Foreground(lipgloss.Color(Quiet)).
 		Bold(true)
 
-	aiStyle := []lipgloss.Style{}
-	aiStyle = append(aiStyle, DefaultSpeech, LoudSpeech, QuietSpeech, MidLoudSpeech, MidQuietSpeech)
+	aiStyle := []lipgloss.Style{DefaultSpeech, LoudSpeech, QuietSpeech, MidLoudSpeech, MidQuietSpeech}
 
 	initialBars := make([]int, SpeechLen)
+	initialMomentum := make([]float64, SpeechLen)
+	initialTargets := make([]float64, SpeechLen)
+	initialSeeds := make([]float64, SpeechLen)
 	initialSpeech := strings.Repeat(speechElems[0], SpeechLen)
+
+	for i := range initialSeeds {
+		initialSeeds[i] = rand.Float64() * 100
+	}
 
 	return model{
 		textInput:      ti,
@@ -124,8 +187,13 @@ func initialModel() model {
 		aiSpeech:       initialSpeech,
 		aiSpeechStyles: aiStyle,
 		barHeights:     initialBars,
+		barMomentum:    initialMomentum,
+		barTargets:     initialTargets,
 		isSpeaking:     false,
 		tickCount:      0,
+		currentVolume:  0.0,
+		volumeHistory:  make([]float64, 10),
+		randomSeeds:    initialSeeds,
 	}
 }
 
@@ -137,40 +205,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case volumeMsg:
+		m.currentVolume = float64(msg)
+
+		copy(m.volumeHistory[1:], m.volumeHistory[0:])
+		m.volumeHistory[0] = m.currentVolume
+
+		if m.isSpeaking {
+			return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
+				return tickMsg(t)
+			})
+		}
+
 	case tickMsg:
 		if m.isSpeaking {
-			if time.Since(m.speakingStart) > 3*time.Second {
+			if _, err := os.Stat("file.mp3"); os.IsNotExist(err) {
 				m.isSpeaking = false
-				m.textInput.SetValue("")
+				m.currentVolume = 0.0
 				for i := range m.barHeights {
 					m.barHeights[i] = 0
 				}
+				m.textInput.SetValue("")
 				return m, nil
 			}
 
-			for i := range SpeechLen {
-				// calculate distance from center (0.0 at edges, 1.0 at center)
-				center := float64(SpeechLen-1) / 2.0
-				distanceFromCenter := 1.0 - math.Abs(float64(i)-center)/center
-
-				// base height follows mouth shape - higher in middle, but edges have minimum height
-				baseHeight := int(1 + float64(4)*distanceFromCenter*distanceFromCenter) // 1-5 range instead of 0-5
-
-				// add some randomness but keep it realistic
-				variation := randRange(-1, 1)
-				height := baseHeight + variation
-
-				if height < 1 { // minimum height of 1 so edges never go to 0
-					height = 1
-				}
-				if height >= 6 { // max height should match number of rows
-					height = 5
-				}
-
-				m.barHeights[i] = height
-			}
-
-			return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+			m.updateBarsFromVolume()
+			return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
 				return tickMsg(t)
 			})
 		}
@@ -180,47 +240,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			m.isSpeaking = true
-
-			// lazy tts cuz i'm lazy hoe :3
-			cmd := exec.Command("python3", "tts.py", m.textInput.Value())
-			err := cmd.Start()
-			if err != nil {
-				fmt.Printf("Error executing python command: %v\n", err)
-				m.isSpeaking = false
-				return m, nil
+			if !m.isSpeaking {
+				m.startSpeaking()
+				return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
+					return tickMsg(t)
+				})
 			}
-
-			go func() {
-				time.Sleep(1 * time.Second)
-				file, err := os.Open("file.mp3")
-				if err != nil {
-				}
-
-				streamer, format, err := mp3.Decode(file)
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer streamer.Close()
-
-				err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				done := make(chan bool)
-				speaker.Play(beep.Seq(streamer, beep.Callback(func() {
-					done <- true
-				})))
-
-				<-done
-				file.Close()
-			}()
-
-			m.speakingStart = time.Now()
-			return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
-				return tickMsg(t)
-			})
 		}
 
 	case errMsg:
@@ -235,14 +260,149 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *model) startSpeaking() {
+	m.isSpeaking = true
+	m.speakingStart = time.Now()
+
+	cmd := exec.Command("python3", "tts.py", m.textInput.Value())
+	err := cmd.Run()
+	if err != nil {
+		fmt.Printf("Error executing python command: %v\n", err)
+		m.isSpeaking = false
+		return
+	}
+
+	go m.playAudioWithVolumeMonitoring()
+}
+
+func (m *model) playAudioWithVolumeMonitoring() {
+	file, err := os.Open("file.mp3")
+	if err != nil {
+		fmt.Printf("Error opening audio file: %v\n", err)
+		m.isSpeaking = false
+		return
+	}
+	defer file.Close()
+
+	streamer, format, err := mp3.Decode(file)
+	if err != nil {
+		fmt.Printf("Error decoding MP3: %v\n", err)
+		m.isSpeaking = false
+		return
+	}
+	defer streamer.Close()
+
+	err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+	if err != nil {
+		fmt.Printf("Error initializing speaker: %v\n", err)
+		m.isSpeaking = false
+		return
+	}
+
+	// start fucking wobbling when actual playback begins
+	m.currentVolume = 0.5
+
+	done := make(chan bool)
+	speaker.Play(beep.Seq(streamer, beep.Callback(func() {
+		done <- true
+	})))
+
+	<-done
+
+	file.Close()
+	os.Remove("file.mp3")
+
+	// the tick handler will detect the missing file and clean up the UI
+}
+
+func (m *model) updateBarsFromVolume() {
+	if !m.isSpeaking {
+		for i := range m.barHeights {
+			m.barHeights[i] = 0
+		}
+		return
+	}
+
+	currentTime := float64(time.Now().UnixMilli())
+
+	// calculate average volume from recent history for stability
+	var avgVolume float64
+	for _, vol := range m.volumeHistory {
+		avgVolume += vol
+	}
+	avgVolume /= float64(len(m.volumeHistory))
+
+	// use both current and average volume for more realistic movement
+	mixedVolume := (m.currentVolume*0.7 + avgVolume*0.3)
+
+	if mixedVolume < 0.15 {
+		mixedVolume = 0.2 + rand.Float64()*0.3
+	} else {
+		// moderate amplification for good range without maxing out
+		mixedVolume = math.Min(mixedVolume*1.8, 0.85)
+	}
+
+	for i := range SpeechLen {
+		// create frequency-based variation
+		// Lower indices = lower frequencies, higher indices = higher frequencies
+		frequencyWeight := 1.0
+		if i < SpeechLen/3 {
+			frequencyWeight = 0.8 + mixedVolume*0.6
+		} else if i > 2*SpeechLen/3 {
+			frequencyWeight = 0.7 + mixedVolume*0.9 + rand.Float64()*0.4
+		} else {
+			frequencyWeight = 0.75 + mixedVolume*0.75
+		}
+
+		phase := m.randomSeeds[i] + currentTime/200.0
+		randomVariation := (math.Sin(phase) + math.Sin(phase*1.7) + math.Sin(phase*0.3)) / 3.0
+		randomVariation *= 0.3
+
+		var neighborInfluence float64
+		if i > 0 {
+			neighborInfluence += float64(m.barHeights[i-1]) * 0.1
+		}
+		if i < SpeechLen-1 {
+			neighborInfluence += float64(m.barHeights[i+1]) * 0.1
+		}
+
+		baseHeight := mixedVolume * frequencyWeight * 10.5
+		targetHeight := baseHeight + randomVariation*2.2 + neighborInfluence
+
+		if targetHeight < 0 {
+			targetHeight = 0
+		}
+		if targetHeight > 9 {
+			targetHeight = 9
+		}
+
+		m.barTargets[i] = targetHeight
+
+		diff := m.barTargets[i] - float64(m.barHeights[i])
+		m.barMomentum[i] = m.barMomentum[i]*0.7 + diff*0.4
+
+		newHeight := float64(m.barHeights[i]) + m.barMomentum[i]
+
+		if newHeight < 0 {
+			newHeight = 0
+		}
+		if newHeight > 9 {
+			newHeight = 9
+		}
+
+		m.barHeights[i] = int(math.Round(newHeight))
+
+		if rand.Float64() < 0.06 && mixedVolume > 0.25 {
+			spike := int(rand.Float64() * 3)
+			if m.barHeights[i]+spike <= 9 {
+				m.barHeights[i] += spike
+			}
+		}
+	}
+}
+
 func (m model) View() string {
 	rows := 10
-	const (
-		Quiet    = "#7aa2f7"
-		MidQuiet = "#7dcfff"
-		MidLoud  = "#b4f9f8"
-		Loud     = "#c0caf5"
-	)
 
 	QuietStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(Quiet))
 	MidQuietStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(MidQuiet))
@@ -251,14 +411,12 @@ func (m model) View() string {
 
 	getRowStyle := func(rowLevel int) lipgloss.Style {
 		switch rowLevel {
-		case 7, 6:
+		case 9, 8, 7:
 			return LoudStyle
-		case 5, 4:
+		case 6, 5, 4:
 			return MidLoudStyle
 		case 3, 2:
 			return MidQuietStyle
-		case 1, 0:
-			return QuietStyle
 		default:
 			return QuietStyle
 		}
@@ -292,8 +450,4 @@ func (m model) View() string {
 	combined := lipgloss.JoinVertical(lipgloss.Center, content, "", speechBars)
 
 	return m.containerStyle.Render(combined)
-}
-
-func randRange(min, max int) int {
-	return rand.Intn(max-min+1) + min
 }

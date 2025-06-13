@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -13,6 +14,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/term"
+	"github.com/faiface/beep"
+	"github.com/faiface/beep/mp3"
+	"github.com/faiface/beep/speaker"
 )
 
 const (
@@ -178,15 +182,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			m.isSpeaking = true
 
-			// Method 1: Using separate arguments (recommended)
+			// lazy tts cuz i'm lazy hoe :3
 			cmd := exec.Command("python3", "tts.py", m.textInput.Value())
-			err := cmd.Start() // Use Start() for non-blocking or Run() for blocking
+			err := cmd.Start()
 			if err != nil {
-				// Handle error appropriately
 				fmt.Printf("Error executing python command: %v\n", err)
 				m.isSpeaking = false
 				return m, nil
 			}
+
+			go func() {
+				time.Sleep(1 * time.Second)
+				file, err := os.Open("file.mp3")
+				if err != nil {
+				}
+
+				streamer, format, err := mp3.Decode(file)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer streamer.Close()
+
+				err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				done := make(chan bool)
+				speaker.Play(beep.Seq(streamer, beep.Callback(func() {
+					done <- true
+				})))
+
+				<-done
+				file.Close()
+			}()
 
 			m.speakingStart = time.Now()
 			return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {

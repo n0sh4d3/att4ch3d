@@ -14,7 +14,14 @@ import (
 	"github.com/charmbracelet/x/term"
 )
 
-const SpeechLen = 20
+const (
+	SpeechLen = 20
+
+	// bubble tea lipgloss.Color values or how tf this is called
+	LoudColor    = "51"
+	DefaultColor = "31"
+	QuietColor   = "4"
+)
 
 var speechElems = []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 
@@ -37,7 +44,7 @@ type model struct {
 	barHeights     []int
 	isSpeaking     bool
 	aiSpeech       string
-	aiSpeechStyle  lipgloss.Style
+	aiSpeechStyle  []lipgloss.Style
 	tickCount      int
 	speakingStart  time.Time
 	err            error
@@ -66,11 +73,27 @@ func initialModel() model {
 		PaddingTop(height/8).
 		Align(lipgloss.Center, lipgloss.Top)
 
-	aiStyle := lipgloss.NewStyle().
+	// this is just fucking sytling
+	DefaultSpeech := lipgloss.NewStyle().
 		Align(lipgloss.Center).
 		Padding(2, 4).
-		Foreground(lipgloss.Color("31")).
+		Foreground(lipgloss.Color(DefaultColor)).
 		Bold(true)
+
+	LoudSpeech := lipgloss.NewStyle().
+		Align(lipgloss.Center).
+		Padding(2, 4).
+		Foreground(lipgloss.Color(LoudColor)).
+		Bold(true)
+
+	QuietSpeech := lipgloss.NewStyle().
+		Align(lipgloss.Center).
+		Padding(2, 4).
+		Foreground(lipgloss.Color(QuietColor)).
+		Bold(true)
+
+	aiStyle := []lipgloss.Style{}
+	aiStyle = append(aiStyle, DefaultSpeech, LoudSpeech, QuietSpeech)
 
 	initialBars := make([]int, SpeechLen)
 	initialSpeech := strings.Repeat(speechElems[0], SpeechLen)
@@ -186,7 +209,7 @@ func (m model) View() string {
 
 	// Join all rows with newlines to create vertical stack
 	m.aiSpeech = strings.Join(allRows, "\n")
-	speechBars := m.aiSpeechStyle.Render(m.aiSpeech)
+	speechBars := m.aiSpeechStyle[0].Render(m.aiSpeech)
 
 	content := m.borderStyle.Render(m.textInput.View())
 	combined := lipgloss.JoinVertical(lipgloss.Center, content, "", speechBars)

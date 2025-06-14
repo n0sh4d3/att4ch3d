@@ -93,6 +93,7 @@ type model struct {
 	barMomentum    []float64
 	barTargets     []float64
 	isSpeaking     bool
+	audioFinished  bool // NEW: track when audio is done but bars are still fading
 	aiSpeech       string
 	aiSpeechStyles []lipgloss.Style
 	tickCount      int
@@ -190,6 +191,7 @@ func initialModel() model {
 		barMomentum:    initialMomentum,
 		barTargets:     initialTargets,
 		isSpeaking:     false,
+		audioFinished:  false, // NEW: initialize to false
 		tickCount:      0,
 		currentVolume:  0.0,
 		volumeHistory:  make([]float64, 10),
@@ -218,18 +220,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tickMsg:
-		if m.isSpeaking {
+		if m.isSpeaking || m.audioFinished {
+			// Check if audio file is gone (playback finished)
 			if _, err := os.Stat("file.mp3"); os.IsNotExist(err) {
-				m.isSpeaking = false
-				m.currentVolume = 0.0
-				for i := range m.barHeights {
-					m.barHeights[i] = 0
+				if m.isSpeaking {
+					// Audio just finished, start fadeout
+					m.isSpeaking = false
+					m.audioFinished = true
+					m.currentVolume = 0.0
 				}
-				m.textInput.SetValue("")
-				return m, nil
 			}
 
+			// Update bars first
 			m.updateBarsFromVolume()
+
+			// After updating, check if all bars have faded to 0
+			if m.audioFinished {
+				allBarsZero := true
+				for _, height := range m.barHeights {
+					if height > 0 {
+						allBarsZero = false
+						break
+					}
+				}
+
+				// If all bars are at 0, stop the animation
+				if allBarsZero {
+					m.audioFinished = false
+					m.textInput.SetValue("")
+					return m, nil
+				}
+			}
+
 			return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
 				return tickMsg(t)
 			})
@@ -240,7 +262,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			if !m.isSpeaking {
+			if !m.isSpeaking && !m.audioFinished {
 				m.startSpeaking()
 				return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
 					return tickMsg(t)
@@ -253,7 +275,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if !m.isSpeaking {
+	if !m.isSpeaking && !m.audioFinished {
 		m.textInput, cmd = m.textInput.Update(msg)
 	}
 
@@ -262,6 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) startSpeaking() {
 	m.isSpeaking = true
+	m.audioFinished = false
 	m.speakingStart = time.Now()
 
 	cmd := exec.Command("python3", "tts.py", m.textInput.Value())
@@ -312,18 +335,36 @@ func (m *model) playAudioWithVolumeMonitoring() {
 	file.Close()
 	os.Remove("file.mp3")
 
-	// the tick handler will detect the missing file and clean up the UI
+	// the tick handler will detect the missing file and start the fadeout process
 }
 
 func (m *model) updateBarsFromVolume() {
-	if !m.isSpeaking {
+	currentTime := float64(time.Now().UnixMilli())
+
+	// if audio is finished, gradually fade all bars to 0
+	if m.audioFinished {
 		for i := range m.barHeights {
-			m.barHeights[i] = 0
+			if m.barHeights[i] > 0 {
+				// mse momentum-based fadeout for smoother animation
+				m.barTargets[i] = 0
+				m.barMomentum[i] = m.barMomentum[i]*0.8 - 0.3 // fade momentum
+
+				newHeight := float64(m.barHeights[i]) + m.barMomentum[i]
+				if newHeight <= 0 {
+					m.barHeights[i] = 0
+					m.barMomentum[i] = 0
+				} else {
+					m.barHeights[i] = int(math.Round(newHeight))
+				}
+			}
 		}
 		return
 	}
 
-	currentTime := float64(time.Now().UnixMilli())
+	// normal operation when audio is playing
+	if !m.isSpeaking {
+		return
+	}
 
 	// calculate average volume from recent history for stability
 	var avgVolume float64
@@ -335,7 +376,7 @@ func (m *model) updateBarsFromVolume() {
 	// use both current and average volume for more realistic movement
 	mixedVolume := (m.currentVolume*0.7 + avgVolume*0.3)
 
-	if mixedVolume < 0.15 {
+	if mixedVolume < 0.10 {
 		mixedVolume = 0.2 + rand.Float64()*0.3
 	} else {
 		// moderate amplification for good range without maxing out
@@ -369,6 +410,7 @@ func (m *model) updateBarsFromVolume() {
 		baseHeight := mixedVolume * frequencyWeight * 10.5
 		targetHeight := baseHeight + randomVariation*2.2 + neighborInfluence
 
+		// could use max but, i just don't care
 		if targetHeight < 0 {
 			targetHeight = 0
 		}
@@ -383,6 +425,7 @@ func (m *model) updateBarsFromVolume() {
 
 		newHeight := float64(m.barHeights[i]) + m.barMomentum[i]
 
+		// could use max but, i just don't care
 		if newHeight < 0 {
 			newHeight = 0
 		}

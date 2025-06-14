@@ -65,7 +65,8 @@ func (vs *VolumeStreamer) Stream(samples [][2]float64) (n int, ok bool) {
 
 	if n > 0 {
 		var sum float64
-		for i := 0; i < n; i++ {
+		// lmafo
+		for i := range n {
 			sample := (samples[i][0] + samples[i][1]) / 2
 			sum += sample * sample
 		}

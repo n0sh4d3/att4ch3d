@@ -1,4 +1,3 @@
-// f
 package main
 
 import (
@@ -31,11 +30,16 @@ const (
 )
 
 var speechElems = []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
+var loadingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 type (
-	errMsg    error
-	tickMsg   time.Time
-	volumeMsg float64
+	errMsg         error
+	tickMsg        time.Time
+	volumeMsg      float64
+	loadingMsg     time.Time
+	ttsCompleteMsg struct{}
+	audioStartMsg  struct{}
+	audioErrorMsg  error
 )
 
 type VolumeStreamer struct {
@@ -95,7 +99,9 @@ type model struct {
 	barMomentum    []float64
 	barTargets     []float64
 	isSpeaking     bool
-	audioFinished  bool // NEW: track when audio is done but bars are still fading
+	audioFinished  bool
+	isLoading      bool // NEW: track loading state
+	loadingTick    int  // NEW: for spinner animation
 	aiSpeech       string
 	aiSpeechStyles []lipgloss.Style
 	tickCount      int
@@ -193,7 +199,9 @@ func initialModel() model {
 		barMomentum:    initialMomentum,
 		barTargets:     initialTargets,
 		isSpeaking:     false,
-		audioFinished:  false, // NEW: initialize to false
+		audioFinished:  false,
+		isLoading:      false, // NEW: initialize loading state
+		loadingTick:    0,     // NEW: initialize spinner
 		tickCount:      0,
 		currentVolume:  0.0,
 		volumeHistory:  make([]float64, 10),
@@ -209,6 +217,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case audioStartMsg:
+		return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		})
+
+	case audioErrorMsg:
+		m.isLoading = false
+		m.isSpeaking = false
+		m.err = msg
+		return m, nil
+
+	case ttsCompleteMsg:
+		m.isLoading = false
+		m.loadingTick = 0
+		// Check if file was actually created
+		if _, err := os.Stat("file.mp3"); err == nil {
+			return m, m.startAudio()
+		} else {
+			// File creation failed
+			m.err = fmt.Errorf("TTS failed to create audio file: %v", err)
+			return m, nil
+		}
+
+	case loadingMsg:
+		if m.isLoading {
+			m.loadingTick = (m.loadingTick + 1) % len(loadingSpinner)
+			return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+				return loadingMsg(t)
+			})
+		}
+
 	case volumeMsg:
 		m.currentVolume = float64(msg)
 
@@ -223,20 +262,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.isSpeaking || m.audioFinished {
-			// Check if audio file is gone (playback finished)
+			// check if audio file is gone (playback finished)
 			if _, err := os.Stat("file.mp3"); os.IsNotExist(err) {
 				if m.isSpeaking {
-					// Audio just finished, start fadeout
+					// audio just finished, start fadeout
 					m.isSpeaking = false
 					m.audioFinished = true
 					m.currentVolume = 0.0
 				}
 			}
 
-			// Update bars first
 			m.updateBarsFromVolume()
 
-			// After updating, check if all bars have faded to 0
 			if m.audioFinished {
 				allBarsZero := true
 				for _, height := range m.barHeights {
@@ -246,7 +283,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				// If all bars are at 0, stop the animation
 				if allBarsZero {
 					m.audioFinished = false
 					m.textInput.SetValue("")
@@ -264,11 +300,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			if !m.isSpeaking && !m.audioFinished {
-				m.startSpeaking()
-				return m, tea.Tick(time.Millisecond*50, func(t time.Time) tea.Msg {
-					return tickMsg(t)
-				})
+			if !m.isSpeaking && !m.audioFinished && !m.isLoading {
+				return m, m.startTTS()
 			}
 		}
 
@@ -277,51 +310,68 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if !m.isSpeaking && !m.audioFinished {
+	if !m.isSpeaking && !m.audioFinished && !m.isLoading {
 		m.textInput, cmd = m.textInput.Update(msg)
 	}
 
 	return m, cmd
 }
 
-func (m *model) startSpeaking() {
+func (m *model) startTTS() tea.Cmd {
+	// First, clean up any existing file
+	if _, err := os.Stat("file.mp3"); err == nil {
+		os.Remove("file.mp3")
+	}
+
+	m.isLoading = true
+	m.loadingTick = 0
+
+	return tea.Batch(
+		tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+			return loadingMsg(t)
+		}),
+		func() tea.Msg {
+			cmd := exec.Command("python3", "tts.py", m.textInput.Value())
+			err := cmd.Run()
+			if err != nil {
+				return errMsg(fmt.Errorf("TTS command failed: %v", err))
+			}
+
+			return ttsCompleteMsg{}
+		},
+	)
+}
+
+func (m *model) startAudio() tea.Cmd {
 	m.isSpeaking = true
 	m.audioFinished = false
 	m.speakingStart = time.Now()
 
-	cmd := exec.Command("python3", "tts.py", m.textInput.Value())
-	err := cmd.Run()
-	if err != nil {
-		fmt.Printf("Error executing python command: %v\n", err)
-		m.isSpeaking = false
-		return
+	return func() tea.Msg {
+		err := m.playAudioWithVolumeMonitoring()
+		if err != nil {
+			return audioErrorMsg(err)
+		}
+		return audioStartMsg{}
 	}
-
-	go m.playAudioWithVolumeMonitoring()
 }
 
-func (m *model) playAudioWithVolumeMonitoring() {
+func (m *model) playAudioWithVolumeMonitoring() error {
 	file, err := os.Open("file.mp3")
 	if err != nil {
-		fmt.Printf("Error opening audio file: %v\n", err)
-		m.isSpeaking = false
-		return
+		return fmt.Errorf("error opening audio file: %v", err)
 	}
 	defer file.Close()
 
 	streamer, format, err := mp3.Decode(file)
 	if err != nil {
-		fmt.Printf("Error decoding MP3: %v\n", err)
-		m.isSpeaking = false
-		return
+		return fmt.Errorf("error decoding MP3: %v", err)
 	}
 	defer streamer.Close()
 
 	err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
 	if err != nil {
-		fmt.Printf("Error initializing speaker: %v\n", err)
-		m.isSpeaking = false
-		return
+		return fmt.Errorf("error initializing speaker: %v", err)
 	}
 
 	// start fucking wobbling when actual playback begins
@@ -337,7 +387,7 @@ func (m *model) playAudioWithVolumeMonitoring() {
 	file.Close()
 	os.Remove("file.mp3")
 
-	// the tick handler will detect the missing file and start the fadeout process
+	return nil
 }
 
 func (m *model) updateBarsFromVolume() {
@@ -434,7 +484,6 @@ func (m *model) updateBarsFromVolume() {
 		if newHeight > 9 {
 			newHeight = 9
 		}
-
 		m.barHeights[i] = int(math.Round(newHeight))
 
 		if rand.Float64() < 0.06 && mixedVolume > 0.25 {
@@ -447,6 +496,23 @@ func (m *model) updateBarsFromVolume() {
 }
 
 func (m model) View() string {
+	// handle loading state
+	if m.isLoading {
+		loadingStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(MidLoud)).
+			Bold(true).
+			Align(lipgloss.Center).
+			Padding(2, 4)
+
+		spinner := loadingSpinner[m.loadingTick]
+		loadingText := fmt.Sprintf("%s att4ch3d mysli...", spinner)
+		loadingDisplay := loadingStyle.Render(loadingText)
+
+		content := m.borderStyle.Render(m.textInput.View())
+		combined := lipgloss.JoinVertical(lipgloss.Center, content, "", loadingDisplay)
+		return m.containerStyle.Render(combined)
+	}
+
 	rows := 10
 
 	QuietStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(Quiet))

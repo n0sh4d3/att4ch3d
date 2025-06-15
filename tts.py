@@ -1,7 +1,8 @@
 from llama_cpp import Llama
 from gtts import gTTS
 import sys
-import argostranslate.package, argostranslate.translate
+import argostranslate.package
+import argostranslate.translate
 
 packages = argostranslate.package.get_available_packages()
 
@@ -40,5 +41,9 @@ translated = argostranslate.translate.translate(response_text, "en", "pl")
 print(translated)
 
 tts = gTTS(text=translated, lang="pl")
-tts.save("response.mp3")
+tts.save("file.mp3")
+
+with open("debug.txt", "w") as f:
+    f.write(translated)
+
 print("zapisano szef")
